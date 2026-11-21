@@ -1,0 +1,33 @@
+{
+  "name": "t3-discord",
+  "version": "1.1.0",
+  "description": "Zero-dependency Discord CLI, MCP server, and global skill for AI coding tools (T3 Code, Claude Code, Claude Desktop, Codex, Cursor, Windsurf, VS Code, Antigravity, Gemini CLI)",
+  "type": "module",
+  "license": "MIT",
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "bin": {
+    "t3-discord": "./install.mjs",
+    "discord-send": "./cli.mjs"
+  },
+  "scripts": {
+    "install-clients": "node ./install.mjs",
+    "test": "node --test test/*.test.mjs"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Tolkium/t3-discord.git"
+  },
+  "keywords": [
+    "discord",
+    "mcp",
+    "t3-code",
+    "claude-code",
+    "codex",
+    "cursor",
+    "vscode",
+    "antigravity",
+    "cli"
+  ]
+}

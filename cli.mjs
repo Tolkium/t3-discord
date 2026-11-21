@@ -1,6 +1,12 @@
 #!/usr/bin/env node
 import fs from "node:fs";
+import path from "node:path";
+import { pathToFileURL } from "node:url";
 import {
+  APP_VERSION,
+  getConfigDir,
+  getConfigPath,
+  getTokenPath,
   getStatus,
   listGuilds,
   listChannels,
@@ -8,17 +14,53 @@ import {
   resolveGuild,
   resolveTarget,
   sendMessage,
+  readMessages,
   setDefault,
   setSender,
   setAlias,
   removeAlias,
   loadConfig,
-  saveToken,
+  verifyAndSaveToken,
   verifyBot,
-  TOKEN_PATH,
+  hasToken,
 } from "./lib/discord.mjs";
 
-function parseArgs(argv) {
+const BOOL_FLAGS = new Set([
+  "json",
+  "stdin",
+  "archived",
+  "suppress-embeds",
+  "no-attach-long",
+  "no-sender",
+  "include-machine",
+  "no-machine",
+  "enable",
+  "disable",
+  "auto",
+  "help",
+  "version",
+]);
+
+const VALUE_FLAGS = new Set([
+  "alias",
+  "server",
+  "channel",
+  "channel-id",
+  "thread",
+  "thread-id",
+  "create-thread",
+  "message-file",
+  "code-file",
+  "lines",
+  "reply-to",
+  "file",
+  "from",
+  "description",
+  "token-file",
+  "limit",
+]);
+
+export function parseArgs(argv) {
   const positional = [];
   const flags = { file: [] };
 
@@ -28,6 +70,14 @@ function parseArgs(argv) {
       positional.push(...argv.slice(i + 1));
       break;
     }
+    if (arg === "-h") {
+      flags.help = true;
+      continue;
+    }
+    if (arg === "-v") {
+      flags.version = true;
+      continue;
+    }
     if (arg.startsWith("--")) {
       const eqIdx = arg.indexOf("=");
       let key;
@@ -35,27 +85,27 @@ function parseArgs(argv) {
       if (eqIdx !== -1) {
         key = arg.slice(2, eqIdx);
         val = arg.slice(eqIdx + 1);
+        if (BOOL_FLAGS.has(key)) {
+          throw new Error(`Flag --${key} does not take a value.`);
+        }
+        if (!VALUE_FLAGS.has(key)) {
+          throw new Error(`Unknown flag: --${key}. Run with --help to see valid flags.`);
+        }
       } else {
         key = arg.slice(2);
-        const boolFlags = new Set([
-          "json",
-          "stdin",
-          "archived",
-          "suppress-embeds",
-          "no-sender",
-          "include-machine",
-          "no-machine",
-          "enable",
-          "disable",
-          "auto",
-          "help",
-        ]);
-        if (boolFlags.has(key)) {
+        if (BOOL_FLAGS.has(key)) {
           val = true;
-        } else {
+        } else if (VALUE_FLAGS.has(key)) {
+          const next = argv[i + 1];
+          if (next === undefined || next.startsWith("--")) {
+            throw new Error(`Flag --${key} requires a value.`);
+          }
           val = argv[++i];
+        } else {
+          throw new Error(`Unknown flag: --${key}. Run with --help to see valid flags.`);
         }
       }
+
       if (key === "file") {
         flags.file.push(val);
       } else {
@@ -81,26 +131,33 @@ function readStdin() {
 }
 
 function printHelp() {
-  console.log(`t3-discord — Send Discord messages from T3 Code (CLI & shared config)
+  console.log(`t3-discord v${APP_VERSION} — Send & read Discord messages from AI coding tools
 
 Usage:
   discord-send status [--json]
+  discord-send doctor [--json]
+  discord-send invite [--json]
   discord-send guilds [--json]
   discord-send channels [--server <name|id>] [--json]
   discord-send threads [--server <name|id>] [--channel <name|id>] [--archived] [--json]
+  discord-send read [--alias <name> | --server <s|id> --channel <c|id> --thread <t|id>] [--limit <1-25>] [--json]
   discord-send send [message] [options]
-    --alias <name>            Use a saved destination alias
-    --server <name|id>        Target server (guild) name or ID
-    --channel <name|id>       Target channel name or ID
-    --thread <name|id>        Target thread name or ID
-    --create-thread <name>    Create a new thread in the target channel
-    --message-file <path>     Read message text from a UTF-8 file
-    --stdin                   Read message text from stdin
-    --file <path>             Attach a file (repeatable)
-    --from <name>             Override sender name for this message
-    --no-sender               Send without prepending sender name
-    --suppress-embeds         Disable link preview embeds
-    --json                    Output JSON
+    --alias <name>              Use a saved destination alias
+    --server <name|id>          Target server (guild) name or ID
+    --channel <name|id>         Target channel name or ID
+    --thread <name|id>          Target thread name or ID
+    --create-thread <name>      Create a new thread in the target channel
+    --reply-to <id|url>         Reply to a Discord message ID or link
+    --code-file <path[:a-b]>    Read a local file (or line range) as a formatted code block
+    --lines <start-end>         Line range for --code-file (e.g. 40-80)
+    --message-file <path>       Read message text from a UTF-8 file
+    --stdin                     Read message text from stdin
+    --file <path>               Attach a local file (absolute path, repeatable, max 10)
+    --no-attach-long            Split >3-chunk messages instead of uploading as snippet file
+    --from <name>               Override sender name for this message
+    --no-sender                 Send without prepending sender name
+    --suppress-embeds           Disable link preview embeds
+    --json                      Output JSON
   discord-send set-default [--server <name|id>] [--channel <name|id>] [--thread <name|id>] [--json]
   discord-send set-sender [name] [--auto] [--include-machine|--no-machine] [--enable|--disable] [--json]
   discord-send alias list [--json]
@@ -118,10 +175,90 @@ function output(data, asJson, humanFormatter) {
   }
 }
 
+async function runDoctor() {
+  const checks = [];
+  const majorNode = Number(process.versions.node.split(".")[0]);
+  checks.push({
+    name: "node",
+    ok: majorNode >= 18,
+    detail: `v${process.versions.node} (${process.execPath})`,
+  });
+
+  const tokPath = getTokenPath();
+  const tokenPresent = hasToken();
+  checks.push({
+    name: "token",
+    ok: tokenPresent,
+    detail: tokenPresent
+      ? process.env.T3_DISCORD_TOKEN
+        ? "T3_DISCORD_TOKEN env var"
+        : process.env.DISCORD_BOT_TOKEN
+          ? "DISCORD_BOT_TOKEN env var"
+          : tokPath
+      : `Missing (${tokPath})`,
+  });
+
+  let bot = null;
+  let guilds = [];
+  if (tokenPresent) {
+    try {
+      bot = await verifyBot();
+      guilds = await listGuilds();
+      checks.push({
+        name: "discord-api",
+        ok: true,
+        detail: `Connected as "${bot.username}" (${bot.id}), ${guilds.length} server(s)`,
+      });
+    } catch (err) {
+      checks.push({ name: "discord-api", ok: false, detail: err.message });
+    }
+  }
+
+  const cfg = loadConfig();
+  if (cfg.defaultChannelId || cfg.defaultThreadId) {
+    try {
+      const target = await resolveTarget({});
+      const dest = target.threadId
+        ? `${target.guildName || target.guildId} / #${target.channelName || target.channelId} > "${target.threadName}"`
+        : `${target.guildName || target.guildId} / #${target.channelName || target.channelId}`;
+      checks.push({ name: "default-target", ok: true, detail: dest });
+    } catch (err) {
+      checks.push({ name: "default-target", ok: false, detail: err.message });
+    }
+  } else {
+    checks.push({
+      name: "default-target",
+      ok: false,
+      detail: "No default channel set (run set-default)",
+    });
+  }
+
+  const cfgDir = getConfigDir();
+  const mcpExists = fs.existsSync(path.join(cfgDir, "mcp-server.mjs"));
+  checks.push({
+    name: "installed-files",
+    ok: mcpExists,
+    detail: mcpExists ? cfgDir : `mcp-server.mjs not found in ${cfgDir}`,
+  });
+
+  return {
+    ok: checks.every((c) => c.ok),
+    version: APP_VERSION,
+    configPath: getConfigPath(),
+    inviteUrl: bot?.inviteUrl || null,
+    checks,
+  };
+}
+
 async function main() {
   const { positional, flags } = parseArgs(process.argv.slice(2));
   const cmd = positional[0];
   const asJson = Boolean(flags.json);
+
+  if (flags.version) {
+    console.log(APP_VERSION);
+    return;
+  }
 
   if (!cmd || cmd === "help" || flags.help) {
     printHelp();
@@ -132,6 +269,7 @@ async function main() {
     const status = await getStatus();
     output(status, asJson, (s) => {
       const lines = [];
+      lines.push(`t3-discord v${s.version}`);
       lines.push(`Token configured: ${s.tokenConfigured ? "yes" : "no"}`);
       if (s.bot) {
         lines.push(`Bot: ${s.bot.username} (${s.bot.id})`);
@@ -140,27 +278,65 @@ async function main() {
         lines.push(`Error: ${s.error}`);
       }
       if (s.guilds.length > 0) {
-        lines.push(`Servers (${s.guilds.length}): ${s.guilds.map((g) => `${g.name} (${g.id})`).join(", ")}`);
+        lines.push(
+          `Servers (${s.guilds.length}): ${s.guilds
+            .map((g) => `${g.name} (${g.id})`)
+            .join(", ")}`
+        );
+      } else if (s.bot?.inviteUrl) {
+        lines.push(`Servers (0): Invite bot -> ${s.bot.inviteUrl}`);
       }
       const d = s.defaultTarget;
       if (d.threadId) {
-        lines.push(`Default: ${d.guildName || d.guildId} / #${d.channelName || d.channelId} > thread "${d.threadName || d.threadId}" (${d.threadId})`);
+        lines.push(
+          `Default: ${d.guildName || d.guildId} / #${d.channelName || d.channelId} > thread "${d.threadName || d.threadId}" (${d.threadId})`
+        );
       } else if (d.channelId) {
-        lines.push(`Default: ${d.guildName || d.guildId} / #${d.channelName || d.channelId} (${d.channelId})`);
+        lines.push(
+          `Default: ${d.guildName || d.guildId} / #${d.channelName || d.channelId} (${d.channelId})`
+        );
       } else {
         lines.push("Default: (not set)");
       }
       const aliasNames = Object.keys(s.aliases);
-      lines.push(`Aliases (${aliasNames.length}): ${aliasNames.length ? aliasNames.join(", ") : "(none)"}`);
+      lines.push(
+        `Aliases (${aliasNames.length}): ${aliasNames.length ? aliasNames.join(", ") : "(none)"}`
+      );
       if (s.sender) {
         const mode = !s.sender.includeSender
           ? "disabled"
-          : `${s.sender.effectiveName}${s.sender.includeMachine && s.sender.host ? ` (${s.sender.host})` : ""} [source: ${s.sender.source}]`;
+          : `${s.sender.effectiveName}${
+              s.sender.includeMachine && s.sender.host ? ` (${s.sender.host})` : ""
+            } [source: ${s.sender.source}]`;
         lines.push(`Sender: ${mode}`);
       }
       lines.push(`Config: ${s.configPath}`);
       return lines.join("\n");
     });
+    return;
+  }
+
+  if (cmd === "doctor") {
+    const report = await runDoctor();
+    output(report, asJson, (r) => {
+      const lines = [`t3-discord doctor (v${r.version})`];
+      for (const c of r.checks) {
+        lines.push(`  [${c.ok ? "OK" : "FAIL"}] ${c.name}: ${c.detail}`);
+      }
+      if (r.inviteUrl) {
+        lines.push(`  Invite URL: ${r.inviteUrl}`);
+      }
+      return lines.join("\n");
+    });
+    if (!report.ok) process.exitCode = 1;
+    return;
+  }
+
+  if (cmd === "invite") {
+    const bot = await verifyBot();
+    output({ botId: bot.id, username: bot.username, inviteUrl: bot.inviteUrl }, asJson, (r) =>
+      `Bot: ${r.username} (${r.botId})\nInvite URL: ${r.inviteUrl}`
+    );
     return;
   }
 
@@ -172,16 +348,17 @@ async function main() {
     } else if (flags.stdin) {
       rawToken = await readStdin();
     } else {
-      throw new Error("Use --token-file <path> or --stdin to save the bot token securely.");
+      throw new Error(
+        "Use --token-file <path> or --stdin to save the bot token securely."
+      );
     }
-    saveToken(rawToken);
-    const bot = await verifyBot();
-    const guilds = await listGuilds();
-    output({ ok: true, tokenPath: TOKEN_PATH, bot, guilds }, asJson, (r) => {
+    const res = await verifyAndSaveToken(rawToken);
+    output(res, asJson, (r) => {
       const serverList = r.guilds.length
         ? r.guilds.map((g) => `${g.name} (${g.id})`).join(", ")
-        : "(none yet — invite the bot to your server)";
-      return `Token saved and verified!\nBot: ${r.bot.username} (${r.bot.id})\nServers: ${serverList}`;
+        : `(none yet — invite here: ${r.inviteUrl})`;
+      const warn = r.permissionWarning ? `\nWarning: ${r.permissionWarning}` : "";
+      return `Token verified and saved!\nBot: ${r.bot.username} (${r.bot.id})\nServers: ${serverList}${warn}`;
     });
     return;
   }
@@ -191,7 +368,7 @@ async function main() {
     output(guilds, asJson, (gs) =>
       gs.length
         ? gs.map((g) => `${g.name}  (id: ${g.id})`).join("\n")
-        : "No servers found. Invite your bot to your Discord server first."
+        : "No servers found. Invite your bot to your Discord server first (run `invite` for the URL)."
     );
     return;
   }
@@ -216,10 +393,13 @@ async function main() {
 
   if (cmd === "threads") {
     const guild = await resolveGuild(flags.server);
+    const cfg = loadConfig();
     let channelId;
     if (flags.channel) {
       const target = await resolveTarget({ server: guild.id, channel: flags.channel });
       channelId = target.channelId;
+    } else if (flags.archived && cfg.defaultChannelId && (!cfg.defaultGuildId || cfg.defaultGuildId === guild.id)) {
+      channelId = cfg.defaultChannelId;
     }
     const threads = await listThreads({
       guildId: guild.id,
@@ -233,10 +413,42 @@ async function main() {
         ts
           .map(
             (t) =>
-              `  "${t.name}" in #${t.parentName || t.parentId || "?"} [${t.archived ? "archived" : "active"}] — id: ${t.id}`
+              `  "${t.name}" in #${t.parentName || t.parentId || "?"} [${
+                t.archived ? "archived" : "active"
+              }] — id: ${t.id}`
           )
           .join("\n")
       );
+    });
+    return;
+  }
+
+  if (cmd === "read") {
+    const res = await readMessages({
+      alias: flags.alias,
+      server: flags.server,
+      channel: flags.channel,
+      thread: flags.thread,
+      channelId: flags["channel-id"],
+      threadId: flags["thread-id"],
+      limit: flags.limit ? Number(flags.limit) : 10,
+    });
+    output(res, asJson, (r) => {
+      const dest = r.threadId
+        ? `${r.guildName || r.guildId} / #${r.channelName || r.channelId} > "${r.threadName || r.threadId}"`
+        : `${r.guildName || r.guildId} / #${r.channelName || r.channelId}`;
+      if (r.messages.length === 0) return `No messages in ${dest}.`;
+      const lines = [`Recent messages in ${dest} (${r.messages.length}):`];
+      for (const m of r.messages) {
+        const ts = m.timestamp ? m.timestamp.slice(0, 16).replace("T", " ") : "";
+        const att =
+          m.attachments.length > 0
+            ? ` [attachments: ${m.attachments.map((a) => a.filename).join(", ")}]`
+            : "";
+        lines.push(`  [${ts}] ${m.author} (${m.id}): ${m.content || "(empty)"}${att}`);
+      }
+      if (r.note) lines.push(`\nNote: ${r.note}`);
+      return lines.join("\n");
     });
     return;
   }
@@ -253,6 +465,8 @@ async function main() {
 
     const res = await sendMessage({
       content,
+      codeFile: flags["code-file"],
+      lines: flags.lines,
       alias: flags.alias,
       server: flags.server,
       channel: flags.channel,
@@ -260,7 +474,9 @@ async function main() {
       channelId: flags["channel-id"],
       threadId: flags["thread-id"],
       createThreadName: flags["create-thread"],
+      replyTo: flags["reply-to"],
       suppressEmbeds: Boolean(flags["suppress-embeds"]),
+      attachLong: !flags["no-attach-long"],
       files: flags.file,
       from: flags.from,
       includeSender: flags["no-sender"] ? false : undefined,
@@ -275,7 +491,12 @@ async function main() {
       const dest = r.threadId
         ? `${r.guildName || r.guildId} / #${r.channelName || r.channelId} > "${r.threadName || r.threadId}"`
         : `${r.guildName || r.guildId} / #${r.channelName || r.channelId}`;
-      return `Sent (${r.chunksSent} message${r.chunksSent === 1 ? "" : "s"}) to ${dest}${r.url ? `\nLink: ${r.url}` : ""}`;
+      const suffix = r.uploadedAsFile
+        ? " (uploaded as snippet file)"
+        : r.chunksSent > 1
+          ? ` (${r.chunksSent} messages)`
+          : "";
+      return `Sent to ${dest}${suffix}${r.url ? `\nLink: ${r.url}` : ""}`;
     });
     return;
   }
@@ -328,7 +549,9 @@ async function main() {
             const target = a.threadId
               ? `#${a.channelName || a.channelId} > "${a.threadName || a.threadId}"`
               : `#${a.channelName || a.channelId}`;
-            return `  ${name} -> ${a.guildName || a.guildId} / ${target}${a.description ? ` — ${a.description}` : ""}`;
+            return `  ${name} -> ${a.guildName || a.guildId} / ${target}${
+              a.description ? ` — ${a.description}` : ""
+            }`;
           })
           .join("\n");
       });
@@ -367,7 +590,13 @@ async function main() {
   throw new Error(`Unknown command "${cmd}". Run with --help for usage.`);
 }
 
-main().catch((err) => {
-  console.error(`Error: ${err.message}`);
-  process.exit(1);
-});
+const isEntrypoint =
+  process.argv[1] &&
+  import.meta.url === pathToFileURL(path.resolve(process.argv[1])).href;
+
+if (isEntrypoint) {
+  main().catch((err) => {
+    console.error(`Error: ${err.message}`);
+    process.exit(1);
+  });
+}
