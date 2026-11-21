@@ -195,10 +195,23 @@ test("discord.mjs core: wrong-server rejection, allowed_mentions, 429 no double-
       assert.ok(threadPost.body instanceof FormData, "Forum starter should carry attachment FormData");
       assert.equal(typeof followUp.body, "string", "Follow-up chunk must NOT re-upload files");
 
-      // 5. codeFile + lines formats slice cleanly
+      // 5. codeFile + lines formats slice cleanly and rejects out-of-range lines
       const codeSlice = mod.parseCodeFileArg(`${sampleFile}:2-3`);
       assert.ok(codeSlice.markdown.includes("lines 2-3"));
       assert.ok(codeSlice.markdown.includes("line2\nline3"));
+      assert.throws(() => mod.parseCodeFileArg(`${sampleFile}:0-2`), /start at 1/i);
+      assert.throws(() => mod.parseCodeFileArg(`${sampleFile}:99-100`), /exceeds file length/i);
+
+      // 5b. Cannot combine createThreadName + replyTo
+      await assert.rejects(
+        () => mod.sendMessage({ content: "hi", createThreadName: "topic", replyTo: "123456789012345678" }),
+        /Cannot combine createThreadName with replyTo/
+      );
+
+      // 5c. setAlias deduplicates case-insensitively
+      await mod.setAlias({ name: "Friend", channel: "code" });
+      await mod.setAlias({ name: "friend", channel: "code" });
+      assert.deepEqual(Object.keys(mod.loadConfig().aliases), ["friend"]);
     } finally {
       fs.rmSync(sampleFile, { force: true });
     }
@@ -226,9 +239,27 @@ test("discord.mjs core: wrong-server rejection, allowed_mentions, 429 no double-
 });
 
 test("installer safe JSON/TOML upsert, collision protection, legacy migration, JSONC skip, and uninstall", async () => {
-  const { upsertJsonMcp, removeJsonMcp, upsertCodexToml, removeCodexToml } = await import(
+  const { parseInstallerArgs, upsertJsonMcp, removeJsonMcp, upsertCodexToml, removeCodexToml } = await import(
     pathToFileURL(path.join(ROOT, "install.mjs")).href
   );
+
+  // Strict installer arg parsing
+  assert.throws(() => parseInstallerArgs(["--node", "--dry-run"]), /requires a value/);
+  assert.throws(() => parseInstallerArgs(["--bogus"]), /Unknown flag/);
+  assert.throws(() => parseInstallerArgs(["--dry-run=true"]), /does not take a value/);
+
+  // loadConfig must NOT create nonexistent config dir on read
+  const { loadConfig } = await import(pathToFileURL(path.join(ROOT, "lib", "discord.mjs")).href);
+  const missingDir = path.join(os.tmpdir(), `t3-discord-missing-${Date.now()}`);
+  const prevDir = process.env.T3_DISCORD_CONFIG_DIR;
+  process.env.T3_DISCORD_CONFIG_DIR = missingDir;
+  try {
+    loadConfig();
+    assert.equal(fs.existsSync(missingDir), false, "loadConfig should not create directory on read");
+  } finally {
+    if (prevDir === undefined) delete process.env.T3_DISCORD_CONFIG_DIR;
+    else process.env.T3_DISCORD_CONFIG_DIR = prevDir;
+  }
 
   const tmp = makeTempDir("t3-discord-inst-");
   try {
